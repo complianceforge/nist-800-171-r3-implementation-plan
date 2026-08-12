@@ -1,0 +1,107 @@
+name: Bootstrap from blueprint
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_id:
+        description: 'Which blueprint project block to apply (project_1 or project_2)'
+        required: true
+        default: 'project_1'
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create labels, milestones and issues
+        env:
+          TOKEN: ${{ github.token }}
+          PID: ${{ github.event.inputs.project_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com/repos/${REPO}"
+          AUTH="Authorization: Bearer ${TOKEN}"
+          ACC="Accept: application/vnd.github+json"
+          BP="GitHub_Projects_Blueprint.json"
+
+          test -f "$BP" || { echo "FATAL: $BP not found at repo root"; exit 1; }
+
+          found=$(jq --arg pid "$PID" '[.projects[]|select(.id==$pid)]|length' "$BP")
+          if [ "$found" != "1" ]; then
+            echo "FATAL: expected exactly 1 project with id=$PID, found $found"
+            exit 1
+          fi
+          echo "Applying blueprint block: $PID"
+
+          echo "=== LABELS ==="
+          jq -c --arg pid "$PID" '.projects[]|select(.id==$pid)|.labels[]' "$BP" | while read -r L; do
+            n=$(jq -r .name <<<"$L")
+            c=$(curl -sS -o /tmp/r.json -w '%{http_code}' -X POST \
+                 -H "$AUTH" -H "$ACC" -d "$L" "$API/labels")
+            if [ "$c" = "201" ]; then
+              echo "  created  $n"
+            elif [ "$c" = "422" ]; then
+              echo "  exists   $n (skipped)"
+            else
+              echo "  FAILED   $n -> HTTP $c"; cat /tmp/r.json; exit 1
+            fi
+          done
+
+          echo "=== MILESTONES ==="
+          jq -c --arg pid "$PID" '.projects[]|select(.id==$pid)|.milestones[]|{title,description}' "$BP" | while read -r M; do
+            t=$(jq -r .title <<<"$M")
+            c=$(curl -sS -o /tmp/r.json -w '%{http_code}' -X POST \
+                 -H "$AUTH" -H "$ACC" -d "$M" "$API/milestones")
+            if [ "$c" = "201" ]; then
+              echo "  created  $t"
+            elif [ "$c" = "422" ]; then
+              echo "  exists   $t (skipped)"
+            else
+              echo "  FAILED   $t -> HTTP $c"; cat /tmp/r.json; exit 1
+            fi
+          done
+
+          echo "=== MAP MILESTONE TITLES TO NUMBERS ==="
+          curl -sS -H "$AUTH" -H "$ACC" "$API/milestones?state=all&per_page=100" \
+            | jq 'map({key:.title, value:.number})|from_entries' > /tmp/ms.json
+          jq -r 'to_entries[]|"  \(.value)  \(.key)"' /tmp/ms.json
+
+          echo "=== ISSUES ==="
+          created=0
+          jq -c --arg pid "$PID" '.projects[]|select(.id==$pid)|.issues[]' "$BP" > /tmp/issues.ndjson
+          total=$(wc -l < /tmp/issues.ndjson)
+          echo "  blueprint declares $total issues"
+
+          while read -r I; do
+            t=$(jq -r .title <<<"$I")
+            msname=$(jq -r .milestone <<<"$I")
+            msnum=$(jq -r --arg k "$msname" '.[$k] // empty' /tmp/ms.json)
+            if [ -z "$msnum" ]; then
+              echo "  FAILED   $t -> milestone not found: $msname"; exit 1
+            fi
+            payload=$(jq -c --argjson n "$msnum" '{title:.title, body:.body, labels:.labels, milestone:$n}' <<<"$I")
+            c=$(curl -sS -o /tmp/r.json -w '%{http_code}' -X POST \
+                 -H "$AUTH" -H "$ACC" -d "$payload" "$API/issues")
+            if [ "$c" = "201" ]; then
+              num=$(jq -r .number /tmp/r.json)
+              echo "  created  #${num}  $t"
+              created=$((created+1))
+            else
+              echo "  FAILED   $t -> HTTP $c"; cat /tmp/r.json; exit 1
+            fi
+            sleep 1
+          done < /tmp/issues.ndjson
+
+          echo "=== SUMMARY ==="
+          echo "  issues created this run: $created of $total declared"
+          if [ "$created" != "$total" ]; then
+            echo "  WARNING: count mismatch"
+            exit 1
+          fi
+          echo "  OK"
